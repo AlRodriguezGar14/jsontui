@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::json::{PathSegment, format_path, pretty_json_lines};
 
-use super::{App, FormatMode, Mode};
+use super::{App, FormatMode, Mode, SourceEditMode};
 
 impl App {
     /// Render one frame: header, tabs, body (main pane + optional outline), footer,
@@ -68,6 +68,11 @@ impl App {
         } else {
             "full"
         };
+        let mode_label = if self.mode == Mode::Source {
+            format!("Source {}", self.source_edit_mode.label())
+        } else {
+            self.mode.label().to_string()
+        };
         let header = vec![
             Line::from(vec![
                 Span::styled(
@@ -77,7 +82,7 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
-                Span::styled(self.mode.label(), Style::default().fg(Color::Cyan)),
+                Span::styled(mode_label, Style::default().fg(Color::Cyan)),
                 Span::raw("  "),
                 Span::raw(self.format_mode.label()),
                 Span::raw("  "),
@@ -366,10 +371,17 @@ impl App {
             row("?", "toggle this help"),
             Line::from(""),
             section("Source mode"),
+            row("Esc", "normal mode"),
+            row("i/a/I/A/o", "insert commands"),
+            row("h/j/k/l", "move cursor"),
+            row("0 / $", "line start / end"),
+            row("gg / G", "buffer start / end"),
+            row("x / X", "delete char"),
+            row("dd", "delete line"),
             row("Ctrl+P", "parse JSON"),
             row("Ctrl+B", "parse + beautify"),
             row("Ctrl+M", "parse + compact"),
-            row("Esc", "back to navigator (if parsed)"),
+            row("Esc normal", "back to navigator (if parsed)"),
             Line::from(""),
             section("Navigate mode"),
             row("j / k", "next / previous row"),
@@ -407,9 +419,14 @@ impl App {
     /// Contextual key cheat-sheet shown in the header, varies per [`Mode`].
     fn key_help(&self) -> Vec<Span<'static>> {
         match self.mode {
-            Mode::Source => vec![Span::raw(
-                "Ctrl+P parse  Ctrl+B beautify  Ctrl+M compact  Esc navigate  Ctrl+C quit",
-            )],
+            Mode::Source => match self.source_edit_mode {
+                SourceEditMode::Insert => vec![Span::raw(
+                    "INSERT  Esc normal  Ctrl+P parse  Ctrl+B beautify  Ctrl+M compact  Ctrl+C quit",
+                )],
+                SourceEditMode::Normal => vec![Span::raw(
+                    "NORMAL  i/a insert  h/j/k/l move  x delete  dd line  gg/G top/end  Esc navigate",
+                )],
+            },
             Mode::Navigate => vec![Span::raw(
                 "j/k nodes  h/l parent/child  / search  yy copy view  Y value  yk pair  Ctrl+N new  ? help",
             )],

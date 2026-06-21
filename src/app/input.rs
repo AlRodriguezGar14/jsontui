@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::json::{cursor_for_line_col, next_char_boundary, row_matches_query};
 
-use super::{App, FormatMode, Mode};
+use super::{App, FormatMode, Mode, SourceEditMode};
 
 impl App {
     /// Entry point for every key event. Clears errors, handles global shortcuts
@@ -64,9 +64,12 @@ impl App {
         }
     }
 
-    /// Keymap for `Source` mode: text editing plus `Ctrl+P/B/M` to parse/beautify/compact.
+    /// Keymap for `Source` mode: Vim-style normal/insert editing plus
+    /// `Ctrl+P/B/M` to parse/beautify/compact.
     fn handle_source_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.source_pending_g = false;
+            self.source_pending_d = false;
             match key.code {
                 KeyCode::Char('p') => {
                     let _ = self.parse_source();
@@ -78,8 +81,25 @@ impl App {
             return;
         }
 
+        match self.source_edit_mode {
+            SourceEditMode::Insert => self.handle_source_insert_key(key),
+            SourceEditMode::Normal => self.handle_source_normal_key(key),
+        }
+    }
+
+    /// Insert-mode source editing. This preserves the original text-entry behavior;
+    /// Esc switches to source normal mode instead of leaving the source editor.
+    fn handle_source_insert_key(&mut self, key: KeyEvent) {
+        self.source_pending_g = false;
+        self.source_pending_d = false;
+
         match key.code {
-            KeyCode::Esc => self.return_to_navigate_if_parsed(),
+            KeyCode::Esc => {
+                self.move_source_left();
+                self.source_edit_mode = SourceEditMode::Normal;
+                self.status =
+                    "Source normal mode. i/a insert, h/j/k/l move, dd delete line.".to_string();
+            }
             KeyCode::Enter => self.insert_source("\n"),
             KeyCode::Tab => self.insert_source("  "),
             KeyCode::Backspace => self.delete_source_before_cursor(),
@@ -93,6 +113,67 @@ impl App {
             KeyCode::Char(ch) => self.insert_source(&ch.to_string()),
             _ => {}
         }
+    }
+
+    /// Vim-style normal mode inside the source editor. This is intentionally small:
+    /// it covers common movement/edit commands without trying to emulate full Vim.
+    fn handle_source_normal_key(&mut self, key: KeyEvent) {
+        if self.source_pending_g {
+            self.source_pending_g = false;
+            if key.code == KeyCode::Char('g') {
+                self.move_source_start();
+                return;
+            }
+        }
+
+        if self.source_pending_d {
+            self.source_pending_d = false;
+            if key.code == KeyCode::Char('d') {
+                self.delete_current_source_line();
+                return;
+            }
+        }
+
+        match key.code {
+            KeyCode::Esc => self.return_to_navigate_if_parsed(),
+            KeyCode::Char('i') => self.enter_source_insert_mode(),
+            KeyCode::Char('a') => {
+                self.move_source_right();
+                self.enter_source_insert_mode();
+            }
+            KeyCode::Char('I') => {
+                self.move_source_line_start();
+                self.enter_source_insert_mode();
+            }
+            KeyCode::Char('A') => {
+                self.move_source_line_end();
+                self.enter_source_insert_mode();
+            }
+            KeyCode::Char('o') => {
+                self.move_source_line_end();
+                self.insert_source("\n");
+                self.enter_source_insert_mode();
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.move_source_left(),
+            KeyCode::Char('j') | KeyCode::Down => self.move_source_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.move_source_up(),
+            KeyCode::Char('l') | KeyCode::Right => self.move_source_right(),
+            KeyCode::Char('0') | KeyCode::Home => self.move_source_line_start(),
+            KeyCode::Char('$') | KeyCode::End => self.move_source_line_end(),
+            KeyCode::Char('g') => self.source_pending_g = true,
+            KeyCode::Char('G') => self.move_source_end(),
+            KeyCode::Char('d') => self.source_pending_d = true,
+            KeyCode::Char('x') | KeyCode::Delete => self.delete_source_at_cursor(),
+            KeyCode::Char('X') | KeyCode::Backspace => self.delete_source_before_cursor(),
+            _ => {}
+        }
+    }
+
+    fn enter_source_insert_mode(&mut self) {
+        self.source_edit_mode = SourceEditMode::Insert;
+        self.source_pending_g = false;
+        self.source_pending_d = false;
+        self.status = "Source insert mode.".to_string();
     }
 
     /// Keymap for `Navigate` mode: vim-style movement, view switches, search, yank, edit.
@@ -111,6 +192,9 @@ impl App {
             KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('i') => {
                 self.mode = Mode::Source;
+                self.source_edit_mode = SourceEditMode::Insert;
+                self.source_pending_g = false;
+                self.source_pending_d = false;
                 if self.source.is_empty() {
                     self.source = self.formatted_json();
                     self.source_cursor = self.source.len();
@@ -536,6 +620,43 @@ impl App {
         self.source_cursor = cursor_for_line_col(&self.source, line, line_len);
     }
 
+    /// `gg`: move source cursor to the start of the buffer.
+    fn move_source_start(&mut self) {
+        self.source_cursor = 0;
+    }
+
+    /// `G`: move source cursor to the end of the buffer.
+    fn move_source_end(&mut self) {
+        self.source_cursor = self.source.len();
+    }
+
+    /// `dd`: delete the current source line, including one surrounding newline when possible.
+    fn delete_current_source_line(&mut self) {
+        if self.source.is_empty() {
+            return;
+        }
+
+        let start = self.source[..self.source_cursor]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let line_end = self.source[self.source_cursor..]
+            .find('\n')
+            .map(|offset| self.source_cursor + offset)
+            .unwrap_or(self.source.len());
+
+        let (delete_start, delete_end, new_cursor) = if line_end < self.source.len() {
+            (start, line_end + 1, start)
+        } else if start > 0 {
+            (start - 1, line_end, start - 1)
+        } else {
+            (start, line_end, 0)
+        };
+
+        self.source.drain(delete_start..delete_end);
+        self.source_cursor = new_cursor.min(self.source.len());
+    }
+
     /// Insert `text` into `edit_buffer` at `edit_cursor`. Used by search and edit popups.
     fn insert_edit(&mut self, text: &str) {
         self.edit_buffer.insert_str(self.edit_cursor, text);
@@ -645,6 +766,54 @@ mod tests {
         assert!(app.json.is_none());
         assert!(app.rows.is_empty());
         assert!(app.search_query.is_empty());
+        assert_eq!(app.source_edit_mode, SourceEditMode::Insert);
+    }
+
+    #[test]
+    fn source_starts_in_insert_mode_and_esc_enters_normal_mode() {
+        let mut app = App::new();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('{'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert_eq!(app.source_edit_mode, SourceEditMode::Normal);
+        assert!(app.source.is_empty());
+    }
+
+    #[test]
+    fn source_normal_mode_supports_vim_movement_and_insert_commands() {
+        let mut app = App::new();
+        app.source = "one\ntwo".to_string();
+        app.source_cursor = app.source.len();
+        app.source_edit_mode = SourceEditMode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert_eq!(app.source_cursor, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert_eq!(app.source_cursor, app.source.len());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('I'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::NONE));
+
+        assert_eq!(app.source, "one\n>two");
+        assert_eq!(app.source_edit_mode, SourceEditMode::Insert);
+    }
+
+    #[test]
+    fn source_normal_mode_deletes_current_line_with_dd() {
+        let mut app = App::new();
+        app.source = "one\ntwo\nthree".to_string();
+        app.source_cursor = cursor_for_line_col(&app.source, 1, 1);
+        app.source_edit_mode = SourceEditMode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(app.source, "one\nthree");
+        assert_eq!(app.source_cursor, "one\n".len());
     }
 
     #[test]

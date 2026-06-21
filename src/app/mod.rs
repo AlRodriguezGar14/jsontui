@@ -38,6 +38,25 @@ impl Mode {
     }
 }
 
+/// Modal keymap inside the source editor.
+///
+/// `Insert` accepts typed text. `Normal` interprets keys as Vim-style movement
+/// and editing commands.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SourceEditMode {
+    Insert,
+    Normal,
+}
+
+impl SourceEditMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Insert => "Insert",
+            Self::Normal => "Normal",
+        }
+    }
+}
+
 /// Display format for the parsed JSON in the main pane.
 ///
 /// `Raw` shows the original input text untouched; others re-render from the parsed value.
@@ -85,6 +104,9 @@ pub(crate) struct App {
     selected: usize,
     format_mode: FormatMode,
     mode: Mode,
+    source_edit_mode: SourceEditMode,
+    source_pending_g: bool,
+    source_pending_d: bool,
     outline_panel: bool,
     display_scroll: u16,
     edit_buffer: String,
@@ -115,6 +137,9 @@ impl App {
             selected: 0,
             format_mode: FormatMode::Pretty,
             mode: Mode::Source,
+            source_edit_mode: SourceEditMode::Insert,
+            source_pending_g: false,
+            source_pending_d: false,
             outline_panel: true,
             display_scroll: 0,
             edit_buffer: String::new(),
@@ -163,6 +188,9 @@ impl App {
         self.selected = 0;
         self.format_mode = FormatMode::Pretty;
         self.mode = Mode::Source;
+        self.source_edit_mode = SourceEditMode::Insert;
+        self.source_pending_g = false;
+        self.source_pending_d = false;
         self.outline_panel = true;
         self.display_scroll = 0;
         self.edit_buffer.clear();
