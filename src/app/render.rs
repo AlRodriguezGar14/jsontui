@@ -213,7 +213,7 @@ impl App {
                             .add_modifier(Modifier::BOLD),
                     )
                 } else {
-                    Line::from(line.text)
+                    colorized_json_line(&line.text)
                 }
             })
             .collect::<Vec<_>>();
@@ -494,6 +494,123 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+fn colorized_json_line(text: &str) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        let Some(relative_quote) = text[cursor..].find('"') else {
+            push_json_syntax_spans(&mut spans, &text[cursor..]);
+            break;
+        };
+        let quote = cursor + relative_quote;
+        push_json_syntax_spans(&mut spans, &text[cursor..quote]);
+
+        let end = string_literal_end(text, quote);
+        let style = if is_object_key(text, end) {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        spans.push(Span::styled(text[quote..end].to_string(), style));
+        cursor = end;
+    }
+
+    Line::from(spans)
+}
+
+fn push_json_syntax_spans(spans: &mut Vec<Span<'static>>, text: &str) {
+    let mut token = String::new();
+    let mut token_kind = JsonSyntaxKind::Whitespace;
+
+    for char in text.chars() {
+        let kind = JsonSyntaxKind::from_char(char);
+        if !token.is_empty() && kind != token_kind {
+            push_json_syntax_span(spans, std::mem::take(&mut token), token_kind);
+        }
+        token_kind = kind;
+        token.push(char);
+    }
+
+    if !token.is_empty() {
+        push_json_syntax_span(spans, token, token_kind);
+    }
+}
+
+fn push_json_syntax_span(
+    spans: &mut Vec<Span<'static>>,
+    token: String,
+    token_kind: JsonSyntaxKind,
+) {
+    let style = match token_kind {
+        JsonSyntaxKind::Whitespace => Style::default(),
+        JsonSyntaxKind::Punctuation => Style::default().fg(Color::DarkGray),
+        JsonSyntaxKind::Literal => json_literal_style(&token),
+    };
+    spans.push(Span::styled(token, style));
+}
+
+fn json_literal_style(token: &str) -> Style {
+    match token {
+        "true" | "false" => Style::default().fg(Color::Cyan),
+        "null" => Style::default().fg(Color::DarkGray),
+        _ if is_json_number_token(token) => Style::default().fg(Color::Yellow),
+        _ => Style::default(),
+    }
+}
+
+fn is_json_number_token(token: &str) -> bool {
+    token
+        .chars()
+        .next()
+        .is_some_and(|char| char == '-' || char.is_ascii_digit())
+        && token
+            .chars()
+            .all(|char| char.is_ascii_digit() || matches!(char, '-' | '+' | '.' | 'e' | 'E'))
+}
+
+fn string_literal_end(text: &str, start: usize) -> usize {
+    let mut escaped = false;
+    for (offset, char) in text[start + 1..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if char == '\\' {
+            escaped = true;
+        } else if char == '"' {
+            return start + 1 + offset + char.len_utf8();
+        }
+    }
+    text.len()
+}
+
+fn is_object_key(text: &str, string_end: usize) -> bool {
+    text[string_end..]
+        .chars()
+        .find(|char| !char.is_whitespace())
+        .is_some_and(|char| char == ':')
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum JsonSyntaxKind {
+    Whitespace,
+    Punctuation,
+    Literal,
+}
+
+impl JsonSyntaxKind {
+    fn from_char(char: char) -> Self {
+        if char.is_whitespace() {
+            Self::Whitespace
+        } else if matches!(char, '{' | '}' | '[' | ']' | ':' | ',') {
+            Self::Punctuation
+        } else {
+            Self::Literal
+        }
+    }
+}
+
 fn wrapped_line_height(text: &str, width: u16) -> usize {
     if width == 0 {
         return 0;
@@ -615,5 +732,49 @@ mod tests {
         app.keep_pretty_line_visible(&lines, 1, 10, 3);
 
         assert_eq!(app.display_scroll, 3);
+    }
+
+    #[test]
+    fn colorizes_pretty_json_keys_and_string_values() {
+        let line = colorized_json_line(r#"  "name": "Ada","#);
+
+        assert_eq!(
+            span_style(&line, r#""name""#),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(
+            span_style(&line, r#""Ada""#),
+            Style::default().fg(Color::Green)
+        );
+    }
+
+    #[test]
+    fn colorizes_pretty_json_literals() {
+        let number = colorized_json_line(r#"  "age": -42.5,"#);
+        let boolean = colorized_json_line(r#"  "active": true,"#);
+        let null = colorized_json_line(r#"  "missing": null"#);
+
+        assert_eq!(
+            span_style(&number, "-42.5"),
+            Style::default().fg(Color::Yellow)
+        );
+        assert_eq!(
+            span_style(&boolean, "true"),
+            Style::default().fg(Color::Cyan)
+        );
+        assert_eq!(
+            span_style(&null, "null"),
+            Style::default().fg(Color::DarkGray)
+        );
+    }
+
+    fn span_style(line: &Line<'_>, content: &str) -> Style {
+        line.spans
+            .iter()
+            .find(|span| span.content.as_ref() == content)
+            .map(|span| span.style)
+            .unwrap_or_else(|| panic!("span not found: {content}"))
     }
 }
