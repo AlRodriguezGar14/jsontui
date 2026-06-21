@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
+use unicode_width::UnicodeWidthChar;
 
 use crate::json::{PathSegment, format_path, pretty_json_lines};
 
@@ -191,7 +192,12 @@ impl App {
         });
 
         if let Some(line_index) = selected_line {
-            self.keep_line_visible(line_index, area.height.saturating_sub(2) as usize);
+            self.keep_pretty_line_visible(
+                &pretty_lines,
+                line_index,
+                area.width.saturating_sub(2),
+                area.height.saturating_sub(2) as usize,
+            );
         }
 
         let lines = pretty_lines
@@ -230,18 +236,42 @@ impl App {
             .unwrap_or_else(|| title.to_string())
     }
 
-    /// Adjust `display_scroll` so `line_index` falls inside a viewport of `visible_height` lines.
-    fn keep_line_visible(&mut self, line_index: usize, visible_height: usize) {
+    /// Adjust `display_scroll` so the selected pretty-JSON line falls inside the viewport.
+    ///
+    /// The paragraph wraps long values, and Ratatui applies vertical scroll after wrapping. That
+    /// means the scroll target must be measured in rendered rows rather than source line indexes.
+    fn keep_pretty_line_visible(
+        &mut self,
+        lines: &[crate::json::PrettyJsonLine],
+        line_index: usize,
+        visible_width: u16,
+        visible_height: usize,
+    ) {
         if visible_height == 0 {
             return;
         }
 
+        let line_start = lines
+            .iter()
+            .take(line_index)
+            .map(|line| wrapped_line_height(&line.text, visible_width))
+            .sum::<usize>();
+        let line_height = lines
+            .get(line_index)
+            .map(|line| wrapped_line_height(&line.text, visible_width))
+            .unwrap_or(1)
+            .max(1);
+        let line_end = line_start + line_height;
         let scroll = self.display_scroll as usize;
-        if line_index < scroll {
-            self.display_scroll = line_index as u16;
-        } else if line_index >= scroll + visible_height {
-            self.display_scroll = line_index
-                .saturating_sub(visible_height.saturating_sub(1))
+        if line_start < scroll {
+            self.display_scroll = line_start as u16;
+        } else if line_height > visible_height {
+            if line_start >= scroll + visible_height {
+                self.display_scroll = line_start.min(u16::MAX as usize) as u16;
+            }
+        } else if line_end > scroll + visible_height {
+            self.display_scroll = line_end
+                .saturating_sub(visible_height)
                 .min(u16::MAX as usize) as u16;
         }
     }
@@ -462,4 +492,128 @@ fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+fn wrapped_line_height(text: &str, width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+
+    let width = width as usize;
+    let mut lines = 1;
+    let mut line_width = 0;
+    let mut pending_whitespace = 0;
+
+    for (is_whitespace, token_width) in wrap_tokens(text) {
+        if is_whitespace {
+            pending_whitespace += token_width;
+            continue;
+        }
+
+        if line_width == 0 {
+            if pending_whitespace > 0 {
+                let whitespace_lines = pending_whitespace.div_ceil(width);
+                lines += whitespace_lines.saturating_sub(1);
+                line_width = pending_whitespace % width;
+                if line_width == 0 {
+                    line_width = width;
+                }
+                pending_whitespace = 0;
+            }
+        }
+
+        if token_width > width {
+            if line_width > 0 {
+                lines += 1;
+            }
+            let token_lines = token_width.div_ceil(width);
+            lines += token_lines.saturating_sub(1);
+            line_width = token_width % width;
+            if line_width == 0 {
+                line_width = width;
+            }
+        } else if line_width + pending_whitespace + token_width <= width {
+            line_width += pending_whitespace + token_width;
+        } else {
+            lines += 1;
+            line_width = token_width;
+        }
+        pending_whitespace = 0;
+    }
+
+    if pending_whitespace > 0 {
+        let available = width.saturating_sub(line_width);
+        pending_whitespace = pending_whitespace.saturating_sub(available);
+        if pending_whitespace > 0 {
+            lines += pending_whitespace.div_ceil(width);
+        }
+    }
+
+    lines
+}
+
+fn wrap_tokens(text: &str) -> Vec<(bool, usize)> {
+    let mut tokens = Vec::new();
+    let mut current_kind = None;
+    let mut current_width = 0;
+
+    for char in text.chars() {
+        let is_whitespace = char.is_whitespace();
+        if current_kind.is_some_and(|kind| kind != is_whitespace) {
+            tokens.push((current_kind.unwrap(), current_width));
+            current_width = 0;
+        }
+
+        current_kind = Some(is_whitespace);
+        current_width += char.width().unwrap_or(0);
+    }
+
+    if let Some(kind) = current_kind {
+        tokens.push((kind, current_width));
+    }
+
+    tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::json::PrettyJsonLine;
+
+    fn line(text: &str) -> PrettyJsonLine {
+        PrettyJsonLine {
+            text: text.to_string(),
+            path: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn pretty_scroll_accounts_for_wrapped_rows_before_selection() {
+        let mut app = App::new();
+        let lines = vec![line(&"x".repeat(50)), line("ok")];
+
+        app.keep_pretty_line_visible(&lines, 1, 10, 3);
+
+        assert_eq!(app.display_scroll, 3);
+    }
+
+    #[test]
+    fn pretty_scroll_keeps_start_of_oversized_selected_line_visible() {
+        let mut app = App::new();
+        let lines = vec![line("short"), line(&"x".repeat(50))];
+
+        app.keep_pretty_line_visible(&lines, 1, 10, 3);
+
+        assert_eq!(app.display_scroll, 0);
+    }
+
+    #[test]
+    fn pretty_scroll_jumps_to_start_of_oversized_selected_line_below_viewport() {
+        let mut app = App::new();
+        let lines = vec![line(&"x".repeat(30)), line(&"y".repeat(50))];
+
+        app.keep_pretty_line_visible(&lines, 1, 10, 3);
+
+        assert_eq!(app.display_scroll, 3);
+    }
 }
