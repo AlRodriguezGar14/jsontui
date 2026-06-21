@@ -6,6 +6,9 @@ and copying JSON.
 It keeps object key order intact, provides synchronized tree context for large
 documents, and supports quick clipboard workflows from inside the terminal.
 
+<img width="1920" height="1173" alt="Screenshot 2026-06-21 at 21 57 58" src="https://github.com/user-attachments/assets/3332bb81-f891-4461-b0f0-c58858ae2cf5" />
+
+
 ## Run It
 
 ```bash
