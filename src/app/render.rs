@@ -11,6 +11,8 @@ use crate::json::{PathSegment, format_path, pretty_json_lines};
 
 use super::{App, FormatMode, Mode, SourceEditMode};
 
+const SELECTED_BAR_FG: Color = Color::Rgb(255, 245, 220);
+
 impl App {
     /// Render one frame: header, tabs, body (main pane + optional outline), footer,
     /// and any active popup. Called once per event-loop tick.
@@ -190,8 +192,18 @@ impl App {
                 .iter()
                 .position(|line| line.path.as_slice() == path)
         });
+        let line_selection_range = if self.mode == Mode::LineSelect {
+            self.line_selection_range()
+        } else {
+            None
+        };
+        let scroll_target = if self.mode == Mode::LineSelect {
+            self.line_selection_cursor
+        } else {
+            selected_line
+        };
 
-        if let Some(line_index) = selected_line {
+        if let Some(line_index) = scroll_target {
             self.keep_pretty_line_visible(
                 &pretty_lines,
                 line_index,
@@ -204,11 +216,22 @@ impl App {
             .into_iter()
             .enumerate()
             .map(|(index, line)| {
-                if Some(index) == selected_line {
+                if line_selection_range
+                    .as_ref()
+                    .is_some_and(|range| range.contains(&index))
+                {
                     Line::styled(
                         line.text,
                         Style::default()
-                            .fg(Color::Black)
+                            .fg(SELECTED_BAR_FG)
+                            .bg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else if Some(index) == selected_line {
+                    Line::styled(
+                        line.text,
+                        Style::default()
+                            .fg(SELECTED_BAR_FG)
                             .bg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
                     )
@@ -311,7 +334,7 @@ impl App {
             .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(SELECTED_BAR_FG)
                     .bg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             )
@@ -428,6 +451,7 @@ impl App {
             row("yy", "copy current view"),
             row("Y / yv", "copy selected value"),
             row("yk", "copy \"key\": value pair"),
+            row("V", "select pretty JSON lines"),
             row("q", "quit"),
             Line::from(""),
             section("Search / Edit popups"),
@@ -459,6 +483,9 @@ impl App {
             },
             Mode::Navigate => vec![Span::raw(
                 "j/k nodes  h/l parent/child  / search  yy copy view  Y value  yk pair  Ctrl+N new  ? help",
+            )],
+            Mode::LineSelect => vec![Span::raw(
+                "VISUAL LINE  j/k extend  y copy lines  Esc cancel",
             )],
             Mode::Search => vec![Span::raw(
                 "Enter search  Esc cancel  n/N repeat after search",
@@ -627,16 +654,14 @@ fn wrapped_line_height(text: &str, width: u16) -> usize {
             continue;
         }
 
-        if line_width == 0 {
-            if pending_whitespace > 0 {
-                let whitespace_lines = pending_whitespace.div_ceil(width);
-                lines += whitespace_lines.saturating_sub(1);
-                line_width = pending_whitespace % width;
-                if line_width == 0 {
-                    line_width = width;
-                }
-                pending_whitespace = 0;
+        if line_width == 0 && pending_whitespace > 0 {
+            let whitespace_lines = pending_whitespace.div_ceil(width);
+            lines += whitespace_lines.saturating_sub(1);
+            line_width = pending_whitespace % width;
+            if line_width == 0 {
+                line_width = width;
             }
+            pending_whitespace = 0;
         }
 
         if token_width > width {

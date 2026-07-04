@@ -1,22 +1,26 @@
 mod input;
 mod render;
 
+use std::ops::RangeInclusive;
+
 use serde_json::Value;
 
 use crate::json::{
     JsonRow, PathSegment, flatten_json, get_value_at_path, get_value_at_path_mut,
-    line_col_for_cursor,
+    line_col_for_cursor, pretty_json_lines,
 };
 
 /// Top-level UI mode. Decides which keymap is active and which pane has focus.
 ///
 /// - `Source`: raw text editor before parse
+/// - `LineSelect`: Vim-like line selection (shift + v)
 /// - `Navigate`: formatted JSON plus outline, vim-style movement
 /// - `Search`: filter rows by query
 /// - `EditKey` / `EditValue`: in-place edit of the selected row
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Mode {
     Source,
+    LineSelect,
     Navigate,
     Search,
     EditKey,
@@ -29,6 +33,7 @@ impl Mode {
     fn label(self) -> &'static str {
         match self {
             Self::Source => "Source",
+            Self::LineSelect => "Line Select",
             Self::Navigate => "Navigate",
             Self::Search => "Search",
             Self::EditKey => "Edit Key",
@@ -98,6 +103,8 @@ pub(crate) struct App {
     source: String,
     source_cursor: usize,
     source_scroll: usize,
+    line_selection_anchor: Option<usize>,
+    line_selection_cursor: Option<usize>,
     raw_source: String,
     json: Option<Value>,
     rows: Vec<JsonRow>,
@@ -131,6 +138,8 @@ impl App {
             source: String::new(),
             source_cursor: 0,
             source_scroll: 0,
+            line_selection_anchor: None,
+            line_selection_cursor: None,
             raw_source: String::new(),
             json: None,
             rows: Vec::new(),
@@ -182,6 +191,8 @@ impl App {
         self.source.clear();
         self.source_cursor = 0;
         self.source_scroll = 0;
+        self.line_selection_anchor = None;
+        self.line_selection_cursor = None;
         self.raw_source.clear();
         self.json = None;
         self.rows.clear();
@@ -347,6 +358,51 @@ impl App {
         Some(format!("{key}: {value}"))
     }
 
+    /// Pretty-view line index for the currently selected JSON row.
+    fn selected_pretty_line_index(&self) -> Option<usize> {
+        let json = self.json.as_ref()?;
+        let selected_path = self.selected_row()?.path.as_slice();
+
+        pretty_json_lines(json)
+            .iter()
+            .position(|line| line.path.as_slice() == selected_path)
+    }
+
+    /// Inclusive line range currently covered by visual-line selection.
+    fn line_selection_range(&self) -> Option<RangeInclusive<usize>> {
+        let anchor = self.line_selection_anchor?;
+        let cursor = self.line_selection_cursor?;
+
+        Some(anchor.min(cursor)..=anchor.max(cursor))
+    }
+
+    /// Pretty JSON text currently covered by visual-line selection.
+    fn selected_lines_text(&self) -> Option<String> {
+        let json = self.json.as_ref()?;
+        let lines = pretty_json_lines(json);
+        if lines.is_empty() {
+            return None;
+        }
+
+        let range = self.line_selection_range()?;
+        let start = (*range.start()).min(lines.len() - 1);
+        let end = (*range.end()).min(lines.len() - 1);
+
+        Some(
+            lines[start..=end]
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// Clear visual-line selection state without changing the active mode.
+    fn clear_line_selection(&mut self) {
+        self.line_selection_anchor = None;
+        self.line_selection_cursor = None;
+    }
+
     /// Stage `text` for the event loop to push to the clipboard. `description` shows in the status.
     fn queue_clipboard(&mut self, text: String, description: &str) {
         let bytes = text.len();
@@ -387,6 +443,20 @@ impl App {
         };
 
         self.queue_clipboard(text, "selected key/value pair");
+    }
+
+    /// `y` in line-select mode: copy the selected pretty JSON lines.
+    fn yank_selected_lines(&mut self) {
+        let Some(text) = self.selected_lines_text() else {
+            self.error = Some("No selected JSON lines to yank.".to_string());
+            self.clear_line_selection();
+            self.mode = Mode::Navigate;
+            return;
+        };
+
+        self.clear_line_selection();
+        self.mode = Mode::Navigate;
+        self.queue_clipboard(text, "selected lines");
     }
 
     /// `e` / `Enter`: load the selected value into `edit_buffer` and enter `EditValue`.

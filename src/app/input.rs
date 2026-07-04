@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::json::{cursor_for_line_col, next_char_boundary, row_matches_query};
+use crate::json::{cursor_for_line_col, next_char_boundary, pretty_json_lines, row_matches_query};
 
 use super::{App, FormatMode, Mode, SourceEditMode};
 
@@ -26,6 +26,7 @@ impl App {
         match self.mode {
             Mode::Source => self.handle_source_key(key),
             Mode::Navigate => self.handle_navigate_key(key),
+            Mode::LineSelect => self.handle_line_select_key(key),
             Mode::Search => self.handle_search_key(key),
             Mode::EditKey | Mode::EditValue => self.handle_edit_key(key),
             Mode::Help => self.handle_help_key(key),
@@ -49,7 +50,8 @@ impl App {
             }
             Mode::Search | Mode::EditKey | Mode::EditValue => self.insert_edit(text),
             Mode::Help => {}
-            Mode::Navigate => {
+            Mode::Navigate | Mode::LineSelect => {
+                self.clear_line_selection();
                 self.mode = Mode::Source;
                 self.source.clear();
                 self.source_cursor = 0;
@@ -228,10 +230,47 @@ impl App {
             KeyCode::Char('/') => self.begin_search(),
             KeyCode::Char('n') => self.repeat_search(true),
             KeyCode::Char('N') => self.repeat_search(false),
+            KeyCode::Char('V') => self.begin_line_select(),
             KeyCode::Char('y') => self.begin_yank(),
             KeyCode::Char('Y') => self.yank_selected_value(),
             KeyCode::Char('e') | KeyCode::Enter => self.begin_value_edit(),
             KeyCode::Char('K') => self.begin_key_edit(),
+            _ => {}
+        }
+    }
+
+    /// `V` in `Navigate`: enter Vim-like visual-line mode for the pretty JSON view.
+    fn begin_line_select(&mut self) {
+        if self.format_mode != FormatMode::Pretty {
+            self.error =
+                Some("Line selection is only available in the beautified view.".to_string());
+            return;
+        }
+
+        let Some(line_index) = self.selected_pretty_line_index() else {
+            self.error = Some("No pretty JSON line to select.".to_string());
+            return;
+        };
+
+        self.mode = Mode::LineSelect;
+        self.line_selection_anchor = Some(line_index);
+        self.line_selection_cursor = Some(line_index);
+        self.update_line_selection_status();
+    }
+
+    /// Keymap for visual-line mode: extend with j/k, copy with y, cancel with Esc.
+    fn handle_line_select_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_line_selection();
+                self.mode = Mode::Navigate;
+                self.status = "Line selection cancelled.".to_string();
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.move_line_selection_down(),
+            KeyCode::Char('k') | KeyCode::Up => self.move_line_selection_up(),
+            KeyCode::Char('g') | KeyCode::Home => self.move_line_selection_start(),
+            KeyCode::Char('G') | KeyCode::End => self.move_line_selection_end(),
+            KeyCode::Char('y') => self.yank_selected_lines(),
             _ => {}
         }
     }
@@ -476,6 +515,63 @@ impl App {
         self.selected = (self.selected + 1).min(self.rows.len().saturating_sub(1));
     }
 
+    /// Number of lines in the pretty JSON view.
+    fn pretty_line_count(&self) -> usize {
+        self.json
+            .as_ref()
+            .map(|json| pretty_json_lines(json).len())
+            .unwrap_or(0)
+    }
+
+    /// `j` / `Down` in line-select mode: extend the range down by one pretty line.
+    fn move_line_selection_down(&mut self) {
+        let count = self.pretty_line_count();
+        if count == 0 {
+            return;
+        }
+
+        let cursor = self.line_selection_cursor.unwrap_or(0);
+        self.line_selection_cursor = Some((cursor + 1).min(count - 1));
+        self.update_line_selection_status();
+    }
+
+    /// `k` / `Up` in line-select mode: extend the range up by one pretty line.
+    fn move_line_selection_up(&mut self) {
+        let cursor = self.line_selection_cursor.unwrap_or(0);
+        self.line_selection_cursor = Some(cursor.saturating_sub(1));
+        self.update_line_selection_status();
+    }
+
+    /// `g` / `Home` in line-select mode: move the range cursor to the first pretty line.
+    fn move_line_selection_start(&mut self) {
+        if self.pretty_line_count() == 0 {
+            return;
+        }
+
+        self.line_selection_cursor = Some(0);
+        self.update_line_selection_status();
+    }
+
+    /// `G` / `End` in line-select mode: move the range cursor to the last pretty line.
+    fn move_line_selection_end(&mut self) {
+        let count = self.pretty_line_count();
+        if count == 0 {
+            return;
+        }
+
+        self.line_selection_cursor = Some(count - 1);
+        self.update_line_selection_status();
+    }
+
+    fn update_line_selection_status(&mut self) {
+        let Some(range) = self.line_selection_range() else {
+            return;
+        };
+        let selected_lines = range.end() - range.start() + 1;
+        self.status =
+            format!("Line select: {selected_lines} lines. j/k extend, y copy, Esc cancel.");
+    }
+
     /// `Up`: scroll the JSON text viewport.
     fn move_view_up(&mut self) {
         self.display_scroll = self.display_scroll.saturating_sub(1);
@@ -701,6 +797,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn select_path(app: &mut App, path: &str) {
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| row.path_label() == path)
+            .unwrap();
+    }
+
     #[test]
     fn moves_between_parent_and_first_child_in_outline() {
         let mut app = App::new();
@@ -873,11 +977,7 @@ mod tests {
         let mut app = App::new();
         app.set_json(json!({"name": "Ada", "age": 36}), None);
         app.mode = Mode::Navigate;
-        app.selected = app
-            .rows
-            .iter()
-            .position(|row| row.path_label() == "$.age")
-            .unwrap();
+        select_path(&mut app, "$.age");
 
         app.begin_value_edit();
         app.edit_buffer = "37".to_string();
@@ -885,5 +985,94 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT));
 
         assert_eq!(app.take_clipboard(), Some("37".to_string()));
+    }
+
+    #[test]
+    fn capital_v_enters_line_select_mode_on_selected_pretty_line() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        app.format_mode = FormatMode::Pretty;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.mode, Mode::LineSelect);
+        assert_eq!(app.line_selection_anchor, Some(1));
+        assert_eq!(app.line_selection_cursor, Some(1));
+    }
+
+    #[test]
+    fn line_select_j_and_k_extend_the_line_range() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        app.format_mode = FormatMode::Pretty;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.line_selection_anchor, Some(1));
+        assert_eq!(app.line_selection_cursor, Some(2));
+        assert_eq!(app.line_selection_range(), Some(1..=2));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(app.line_selection_anchor, Some(1));
+        assert_eq!(app.line_selection_cursor, Some(0));
+        assert_eq!(app.line_selection_range(), Some(0..=1));
+    }
+
+    #[test]
+    fn line_select_y_yanks_joined_pretty_lines() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        app.format_mode = FormatMode::Pretty;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+
+        assert_eq!(
+            app.take_clipboard(),
+            Some("  \"a\": 1,\n  \"b\": 2".to_string())
+        );
+        assert_eq!(app.mode, Mode::Navigate);
+        assert_eq!(app.line_selection_anchor, None);
+        assert_eq!(app.line_selection_cursor, None);
+    }
+
+    #[test]
+    fn line_select_escape_cancels_and_clears_selection() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1}), None);
+        app.mode = Mode::Navigate;
+        app.format_mode = FormatMode::Pretty;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::Navigate);
+        assert_eq!(app.line_selection_anchor, None);
+        assert_eq!(app.line_selection_cursor, None);
+    }
+
+    #[test]
+    fn line_select_requires_pretty_view() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1}), None);
+        app.mode = Mode::Navigate;
+        app.format_mode = FormatMode::Compact;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.mode, Mode::Navigate);
+        assert!(app.error.is_some());
+        assert_eq!(app.line_selection_anchor, None);
+        assert_eq!(app.line_selection_cursor, None);
     }
 }
