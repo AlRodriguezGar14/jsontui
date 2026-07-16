@@ -2,7 +2,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::json::{cursor_for_line_col, next_char_boundary, pretty_json_lines, row_matches_query};
 
-use super::{App, FormatMode, Mode, SourceEditMode};
+use super::{AddEntryField, App, FormatMode, Mode, SourceEditMode};
 
 impl App {
     /// Entry point for every key event. Clears errors, handles global shortcuts
@@ -28,6 +28,7 @@ impl App {
             Mode::Navigate => self.handle_navigate_key(key),
             Mode::LineSelect => self.handle_line_select_key(key),
             Mode::Search => self.handle_search_key(key),
+            Mode::AddEntry => self.handle_add_entry_key(key),
             Mode::EditKey | Mode::EditValue => self.handle_edit_key(key),
             Mode::Help => self.handle_help_key(key),
         }
@@ -48,6 +49,7 @@ impl App {
                         .to_string();
                 }
             }
+            Mode::AddEntry => self.insert_add_entry(text),
             Mode::Search | Mode::EditKey | Mode::EditValue => self.insert_edit(text),
             Mode::Help => {}
             Mode::Navigate | Mode::LineSelect => {
@@ -234,6 +236,7 @@ impl App {
             KeyCode::Char('y') => self.begin_yank(),
             KeyCode::Char('Y') => self.yank_selected_value(),
             KeyCode::Char('e') | KeyCode::Enter => self.begin_value_edit(),
+            KeyCode::Char('o') => self.begin_entry_add(),
             KeyCode::Char('K') => self.begin_key_edit(),
             _ => {}
         }
@@ -328,6 +331,27 @@ impl App {
             KeyCode::Home => self.edit_cursor = 0,
             KeyCode::End => self.edit_cursor = self.edit_buffer.len(),
             KeyCode::Char(ch) => self.insert_edit(&ch.to_string()),
+            _ => {}
+        }
+    }
+
+    /// Keymap for `AddEntry`: two fields, Tab switches focus, Enter commits.
+    fn handle_add_entry_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.clear_add_entry_state();
+                self.mode = Mode::Navigate;
+                self.status = "Add cancelled.".to_string();
+            }
+            KeyCode::Enter => self.commit_edit(),
+            KeyCode::Tab | KeyCode::BackTab => self.toggle_add_entry_field(),
+            KeyCode::Backspace => self.delete_add_entry_before_cursor(),
+            KeyCode::Delete => self.delete_add_entry_at_cursor(),
+            KeyCode::Left => self.move_add_entry_left(),
+            KeyCode::Right => self.move_add_entry_right(),
+            KeyCode::Home => self.set_add_entry_cursor_start(),
+            KeyCode::End => self.set_add_entry_cursor_end(),
+            KeyCode::Char(ch) => self.insert_add_entry(&ch.to_string()),
             _ => {}
         }
     }
@@ -790,6 +814,68 @@ impl App {
     fn move_edit_right(&mut self) {
         self.edit_cursor = next_char_boundary(&self.edit_buffer, self.edit_cursor);
     }
+
+    fn toggle_add_entry_field(&mut self) {
+        self.add_entry_field = match self.add_entry_field {
+            AddEntryField::Key => AddEntryField::Value,
+            AddEntryField::Value => AddEntryField::Key,
+        };
+    }
+
+    fn active_add_entry_buffer_mut(&mut self) -> (&mut String, &mut usize) {
+        match self.add_entry_field {
+            AddEntryField::Key => (&mut self.add_key_buffer, &mut self.add_key_cursor),
+            AddEntryField::Value => (&mut self.add_value_buffer, &mut self.add_value_cursor),
+        }
+    }
+
+    fn insert_add_entry(&mut self, text: &str) {
+        let (buffer, cursor) = self.active_add_entry_buffer_mut();
+        buffer.insert_str(*cursor, text);
+        *cursor += text.len();
+    }
+
+    fn delete_add_entry_before_cursor(&mut self) {
+        let (buffer, cursor) = self.active_add_entry_buffer_mut();
+        if *cursor == 0 {
+            return;
+        }
+        if let Some((index, _)) = buffer[..*cursor].char_indices().last() {
+            buffer.drain(index..*cursor);
+            *cursor = index;
+        }
+    }
+
+    fn delete_add_entry_at_cursor(&mut self) {
+        let (buffer, cursor) = self.active_add_entry_buffer_mut();
+        if *cursor >= buffer.len() {
+            return;
+        }
+        let next = next_char_boundary(buffer, *cursor);
+        buffer.drain(*cursor..next);
+    }
+
+    fn move_add_entry_left(&mut self) {
+        let (buffer, cursor) = self.active_add_entry_buffer_mut();
+        if let Some((index, _)) = buffer[..*cursor].char_indices().last() {
+            *cursor = index;
+        }
+    }
+
+    fn move_add_entry_right(&mut self) {
+        let (buffer, cursor) = self.active_add_entry_buffer_mut();
+        *cursor = next_char_boundary(buffer, *cursor);
+    }
+
+    fn set_add_entry_cursor_start(&mut self) {
+        let (_, cursor) = self.active_add_entry_buffer_mut();
+        *cursor = 0;
+    }
+
+    fn set_add_entry_cursor_end(&mut self) {
+        let (buffer, cursor) = self.active_add_entry_buffer_mut();
+        *cursor = buffer.len();
+    }
 }
 
 #[cfg(test)]
@@ -803,6 +889,12 @@ mod tests {
             .iter()
             .position(|row| row.path_label() == path)
             .unwrap();
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for char in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(char), KeyModifiers::NONE));
+        }
     }
 
     #[test]
@@ -988,6 +1080,89 @@ mod tests {
     }
 
     #[test]
+    fn o_adds_key_value_after_selected_object_entry() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::AddEntry);
+        assert_eq!(app.editing_path, Vec::<crate::json::PathSegment>::new());
+        assert_eq!(app.entry_insert_index, Some(1));
+        assert_eq!(app.add_entry_field, AddEntryField::Key);
+        assert!(app.add_key_buffer.is_empty());
+        assert!(app.add_value_buffer.is_empty());
+
+        type_text(&mut app, "name");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.add_entry_field, AddEntryField::Value);
+        type_text(&mut app, "Ada");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"name":"Ada","b":2}"#
+        );
+        assert_eq!(app.selected_row().unwrap().path_label(), "$.name");
+        assert!(serde_json::from_str::<serde_json::Value>(&app.source).is_ok());
+        assert_eq!(app.source, app.raw_source);
+    }
+
+    #[test]
+    fn o_appends_key_value_inside_selected_object() {
+        let mut app = App::new();
+        app.set_json(json!({"obj": {"a": 1}, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.obj");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::AddEntry);
+        assert_eq!(
+            app.editing_path,
+            vec![crate::json::PathSegment::Key("obj".to_string())]
+        );
+        assert_eq!(app.entry_insert_index, Some(1));
+
+        app.add_key_buffer = "z".to_string();
+        app.add_key_cursor = app.add_key_buffer.len();
+        app.add_value_buffer = "false".to_string();
+        app.add_value_cursor = app.add_value_buffer.len();
+        app.add_entry_field = AddEntryField::Value;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"obj":{"a":1,"z":false},"b":2}"#
+        );
+        assert_eq!(app.selected_row().unwrap().path_label(), "$.obj.z");
+    }
+
+    #[test]
+    fn o_rejects_duplicate_key_without_changing_json() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        app.add_key_buffer = "b".to_string();
+        app.add_key_cursor = app.add_key_buffer.len();
+        app.add_value_buffer = "3".to_string();
+        app.add_value_cursor = app.add_value_buffer.len();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.mode, Mode::AddEntry);
+        assert_eq!(app.add_entry_field, AddEntryField::Key);
+        assert!(app.error.as_ref().is_some_and(|error| error.contains("b")));
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"b":2}"#
+        );
+    }
+
     fn capital_v_enters_line_select_mode_on_selected_pretty_line() {
         let mut app = App::new();
         app.set_json(json!({"a": 1, "b": 2}), None);

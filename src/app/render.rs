@@ -9,9 +9,10 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::json::{PathSegment, format_path, pretty_json_lines};
 
-use super::{App, FormatMode, Mode, SourceEditMode};
+use super::{AddEntryField, App, FormatMode, Mode, SourceEditMode};
 
 const SELECTED_BAR_FG: Color = Color::Rgb(255, 245, 220);
+const ADD_ENTRY_LABEL_WIDTH: usize = 8;
 
 impl App {
     /// Render one frame: header, tabs, body (main pane + optional outline), footer,
@@ -51,7 +52,9 @@ impl App {
 
         self.draw_footer(frame, chunks[3]);
 
-        if matches!(self.mode, Mode::EditKey | Mode::EditValue | Mode::Search) {
+        if self.mode == Mode::AddEntry {
+            self.draw_add_entry_popup(frame, area);
+        } else if matches!(self.mode, Mode::EditKey | Mode::EditValue | Mode::Search) {
             self.draw_edit_popup(frame, area);
         }
         if self.mode == Mode::Help {
@@ -398,6 +401,46 @@ impl App {
         });
     }
 
+    /// Two-field popup used by `o` to add an object entry without typing JSON key syntax.
+    fn draw_add_entry_popup(&self, frame: &mut Frame, area: Rect) {
+        let popup = centered_rect(area, 72, 6);
+        let key_active = self.add_entry_field == AddEntryField::Key;
+        let value_active = self.add_entry_field == AddEntryField::Value;
+        let text = vec![
+            Line::from(Span::styled(
+                format_path(&self.editing_path),
+                Style::default().fg(Color::DarkGray),
+            )),
+            add_entry_input_line("key", &self.add_key_buffer, key_active),
+            add_entry_input_line("value", &self.add_value_buffer, value_active),
+            Line::from(Span::styled(
+                "Tab switch  Enter save  Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+        let paragraph = Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("add key/value"),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(Clear, popup);
+        frame.render_widget(paragraph, popup);
+
+        let (cursor, row_offset) = match self.add_entry_field {
+            AddEntryField::Key => (self.add_key_cursor, 2),
+            AddEntryField::Value => (self.add_value_cursor, 3),
+        };
+        let cursor_x = popup.x
+            + 1
+            + ((ADD_ENTRY_LABEL_WIDTH + cursor) as u16).min(popup.width.saturating_sub(2));
+        frame.set_cursor_position(Position {
+            x: cursor_x,
+            y: popup.y + row_offset,
+        });
+    }
+
     /// Full-screen command reference shown while in [`Mode::Help`]. `?` or `Esc` closes it.
     fn draw_help_popup(&self, frame: &mut Frame, area: Rect) {
         let popup = centered_rect(area, 70, area.height.saturating_sub(4).max(10));
@@ -444,6 +487,7 @@ impl App {
             row("b / m / r", "beautify / compact / raw view"),
             row("Tab / S-Tab", "cycle views"),
             row("i", "edit source text"),
+            row("o", "add key/value under cursor"),
             row("e / Enter", "edit selected value as JSON"),
             row("K", "rename selected object key"),
             row("/", "search"),
@@ -456,6 +500,7 @@ impl App {
             Line::from(""),
             section("Search / Edit popups"),
             row("Enter", "commit"),
+            row("Tab", "switch key / value when adding"),
             row("Esc", "cancel"),
         ];
 
@@ -490,6 +535,9 @@ impl App {
             Mode::Search => vec![Span::raw(
                 "Enter search  Esc cancel  n/N repeat after search",
             )],
+            Mode::AddEntry => vec![Span::raw(
+                "ADD  Tab key/value  Enter save  Esc cancel  value infers string, number, bool, null, object, or array",
+            )],
             Mode::EditKey | Mode::EditValue => {
                 vec![Span::raw(
                     "Enter save  Esc cancel  value edits must be valid JSON",
@@ -498,6 +546,26 @@ impl App {
             Mode::Help => vec![Span::raw("? or Esc close help")],
         }
     }
+}
+
+fn add_entry_input_line(label: &'static str, value: &str, active: bool) -> Line<'static> {
+    let label_style = if active {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let value_style = if active {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+
+    Line::from(vec![
+        Span::styled(format!("{label:<7} "), label_style),
+        Span::styled(value.to_string(), value_style),
+    ])
 }
 
 /// Build a `Rect` of `percent_x` width and fixed `height`, centered inside `area`.

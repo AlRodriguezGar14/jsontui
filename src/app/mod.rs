@@ -16,6 +16,7 @@ use crate::json::{
 /// - `LineSelect`: Vim-like line selection (shift + v)
 /// - `Navigate`: formatted JSON plus outline, vim-style movement
 /// - `Search`: filter rows by query
+/// - `AddEntry`: insert a new object key/value pair
 /// - `EditKey` / `EditValue`: in-place edit of the selected row
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum Mode {
@@ -23,6 +24,7 @@ enum Mode {
     LineSelect,
     Navigate,
     Search,
+    AddEntry,
     EditKey,
     EditValue,
     Help,
@@ -36,6 +38,7 @@ impl Mode {
             Self::LineSelect => "Line Select",
             Self::Navigate => "Navigate",
             Self::Search => "Search",
+            Self::AddEntry => "Add Entry",
             Self::EditKey => "Edit Key",
             Self::EditValue => "Edit Value",
             Self::Help => "Help",
@@ -60,6 +63,13 @@ impl SourceEditMode {
             Self::Normal => "Normal",
         }
     }
+}
+
+/// Active input in the add-entry popup.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AddEntryField {
+    Key,
+    Value,
 }
 
 /// Display format for the parsed JSON in the main pane.
@@ -119,6 +129,12 @@ pub(crate) struct App {
     edit_buffer: String,
     edit_cursor: usize,
     editing_path: Vec<PathSegment>,
+    entry_insert_index: Option<usize>,
+    add_key_buffer: String,
+    add_key_cursor: usize,
+    add_value_buffer: String,
+    add_value_cursor: usize,
+    add_entry_field: AddEntryField,
     search_query: String,
     search_matches: Vec<usize>,
     search_match_index: Option<usize>,
@@ -154,6 +170,12 @@ impl App {
             edit_buffer: String::new(),
             edit_cursor: 0,
             editing_path: Vec::new(),
+            entry_insert_index: None,
+            add_key_buffer: String::new(),
+            add_key_cursor: 0,
+            add_value_buffer: String::new(),
+            add_value_cursor: 0,
+            add_entry_field: AddEntryField::Key,
             search_query: String::new(),
             search_matches: Vec::new(),
             search_match_index: None,
@@ -207,6 +229,7 @@ impl App {
         self.edit_buffer.clear();
         self.edit_cursor = 0;
         self.editing_path.clear();
+        self.clear_add_entry_state();
         self.search_query.clear();
         self.search_matches.clear();
         self.search_match_index = None;
@@ -475,6 +498,7 @@ impl App {
         self.edit_buffer = serde_json::to_string(value).unwrap_or_default();
         self.edit_cursor = self.edit_buffer.len();
         self.editing_path = path;
+        self.clear_add_entry_state();
         self.mode = Mode::EditValue;
         self.status = "Editing value. Enter a valid JSON value.".to_string();
     }
@@ -501,8 +525,81 @@ impl App {
         self.edit_buffer = key;
         self.edit_cursor = self.edit_buffer.len();
         self.editing_path = path;
+        self.clear_add_entry_state();
         self.mode = Mode::EditKey;
         self.status = "Editing key. Enter saves and keeps the JSON valid.".to_string();
+    }
+
+    /// `o`: start inserting a new key/value entry near the current cursor.
+    ///
+    /// Selecting an object appends inside that object. Selecting an object entry inserts
+    /// a sibling immediately after that entry. Arrays and scalar roots cannot accept keys.
+    fn begin_entry_add(&mut self) {
+        let Some(row) = self.selected_row() else {
+            return;
+        };
+        let selected_path = row.path.clone();
+
+        let (parent_path, insert_index) = match self.entry_add_target(&selected_path) {
+            Ok(target) => target,
+            Err(message) => {
+                self.error = Some(message);
+                return;
+            }
+        };
+
+        let Some(json) = &self.json else {
+            return;
+        };
+        let Some(Value::Object(_)) = get_value_at_path(json, &parent_path) else {
+            self.error = Some("Target is not a JSON object.".to_string());
+            return;
+        };
+
+        self.add_key_buffer.clear();
+        self.add_key_cursor = 0;
+        self.add_value_buffer.clear();
+        self.add_value_cursor = 0;
+        self.add_entry_field = AddEntryField::Key;
+        self.editing_path = parent_path;
+        self.entry_insert_index = Some(insert_index);
+        self.pending_delete = false;
+        self.mode = Mode::AddEntry;
+        self.status = "Adding key/value. Type a key, Tab to value, Enter saves.".to_string();
+    }
+
+    /// Resolve where `o` should insert a new entry.
+    fn entry_add_target(
+        &self,
+        selected_path: &[PathSegment],
+    ) -> Result<(Vec<PathSegment>, usize), String> {
+        let Some(json) = &self.json else {
+            return Err("No parsed JSON to edit.".to_string());
+        };
+        let Some(selected_value) = get_value_at_path(json, selected_path) else {
+            return Err("Selected path no longer exists.".to_string());
+        };
+
+        if let Value::Object(map) = selected_value {
+            return Ok((selected_path.to_vec(), map.len()));
+        }
+
+        let Some((last_segment, parent_path)) = selected_path.split_last() else {
+            return Err("Select a JSON object before adding a key/value pair.".to_string());
+        };
+        let PathSegment::Key(selected_key) = last_segment else {
+            return Err(
+                "Array entries cannot have object keys. Select an object first.".to_string(),
+            );
+        };
+        let Some(Value::Object(parent_map)) = get_value_at_path(json, parent_path) else {
+            return Err("Selected parent is not a JSON object.".to_string());
+        };
+        let Some(index) = parent_map.keys().position(|key| key == selected_key) else {
+            return Err("Selected key no longer exists.".to_string());
+        };
+
+        Ok((parent_path.to_vec(), index + 1))
     }
 
     /// `Enter` in an edit popup. Dispatches to the value or key commit path.
@@ -510,6 +607,7 @@ impl App {
         match self.mode {
             Mode::EditValue => self.commit_value_edit(),
             Mode::EditKey => self.commit_key_edit(),
+            Mode::AddEntry => self.commit_entry_add(),
             _ => {}
         }
     }
@@ -601,7 +699,77 @@ impl App {
         self.after_structural_edit(new_path, "Key renamed.");
     }
 
-    /// Resync derived state after a key rename or value edit: rewrite `source`/`raw_source`,
+    /// Parse and insert a new object entry at the pending target.
+    fn commit_entry_add(&mut self) {
+        let new_key = self.add_key_buffer.clone();
+        if new_key.trim().is_empty() {
+            self.error = Some("Key cannot be empty.".to_string());
+            self.add_entry_field = AddEntryField::Key;
+            return;
+        }
+
+        let new_value = match parse_inferred_json_value(&self.add_value_buffer) {
+            Ok(value) => value,
+            Err(message) => {
+                self.error = Some(message);
+                self.add_entry_field = AddEntryField::Value;
+                return;
+            }
+        };
+
+        let parent_path = self.editing_path.clone();
+        let Some(insert_index) = self.entry_insert_index else {
+            self.error = Some("No insertion target is active.".to_string());
+            return;
+        };
+        let Some(parent) = self
+            .json
+            .as_ref()
+            .and_then(|json| get_value_at_path(json, &parent_path))
+        else {
+            self.error = Some("Target object no longer exists.".to_string());
+            return;
+        };
+        let Value::Object(map) = parent else {
+            self.error = Some("Target is not a JSON object.".to_string());
+            return;
+        };
+
+        if map.contains_key(&new_key) {
+            self.error = Some(format!(
+                "The key \"{new_key}\" already exists at this level."
+            ));
+            self.add_entry_field = AddEntryField::Key;
+            return;
+        }
+
+        self.stash_undo("key/value add");
+
+        let Some(json) = &mut self.json else {
+            return;
+        };
+        let Some(parent) = get_value_at_path_mut(json, &parent_path) else {
+            self.error = Some("Target object no longer exists.".to_string());
+            return;
+        };
+        let Value::Object(map) = parent else {
+            self.error = Some("Target is not a JSON object.".to_string());
+            return;
+        };
+        let index = insert_index.min(map.len());
+        if map
+            .shift_insert(index, new_key.clone(), new_value)
+            .is_some()
+        {
+            self.error = Some("Could not insert key without overwriting an entry.".to_string());
+            return;
+        }
+
+        let mut new_path = parent_path;
+        new_path.push(PathSegment::Key(new_key));
+        self.clear_add_entry_state();
+        self.after_structural_edit(new_path, "Key/value added.");
+    }
     /// reset to `Navigate`/`Pretty`, rebuild rows, and re-focus `select_path`.
     fn after_structural_edit(&mut self, select_path: Vec<PathSegment>, message: &str) {
         if let Some(json) = &self.json {
@@ -625,11 +793,46 @@ impl App {
     fn source_line_col(&self) -> (usize, usize) {
         line_col_for_cursor(&self.source, self.source_cursor)
     }
+
+    fn clear_add_entry_state(&mut self) {
+        self.entry_insert_index = None;
+        self.add_key_buffer.clear();
+        self.add_key_cursor = 0;
+        self.add_value_buffer.clear();
+        self.add_value_cursor = 0;
+        self.add_entry_field = AddEntryField::Key;
+    }
+fn parse_inferred_json_value(text: &str) -> Result<Value, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    match trimmed.chars().next() {
+        Some('{') | Some('[') => serde_json::from_str::<Value>(trimmed)
+            .map_err(|error| format!("Value is not valid JSON: {error}")),
+        Some('"') => match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::String(value)) => Ok(Value::String(value)),
+            Ok(_) => Err("Quoted value must be a JSON string.".to_string()),
+            Err(error) => Err(format!("String value is not valid JSON: {error}")),
+        },
+        Some('-' | '0'..='9') => match serde_json::from_str::<Value>(trimmed) {
+            Ok(Value::Number(number)) => Ok(Value::Number(number)),
+            Ok(_) => Err("Number-like value did not parse as a JSON number.".to_string()),
+            Err(error) => Err(format!(
+                "Number-like value is not valid JSON. Quote it for text: {error}"
+            )),
+        },
+        _ if matches!(trimmed, "true" | "false" | "null") => serde_json::from_str::<Value>(trimmed)
+            .map_err(|error| format!("Value is not valid JSON: {error}")),
+        _ => Ok(Value::String(trimmed.to_string())),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn renames_object_key_without_moving_its_position() {
@@ -650,6 +853,19 @@ mod tests {
         assert_eq!(
             app.rows.iter().map(JsonRow::path_label).collect::<Vec<_>>(),
             vec!["$", "$.z", "$.x", "$.m"]
+        );
+    }
+
+    #[test]
+    fn infers_add_entry_values_from_plain_text() {
+        assert_eq!(parse_inferred_json_value("Ada").unwrap(), json!("Ada"));
+        assert_eq!(parse_inferred_json_value("37").unwrap(), json!(37));
+        assert_eq!(parse_inferred_json_value("true").unwrap(), json!(true));
+        assert_eq!(parse_inferred_json_value("").unwrap(), Value::Null);
+        assert_eq!(parse_inferred_json_value(r#""37""#).unwrap(), json!("37"));
+        assert_eq!(
+            parse_inferred_json_value(r#"{"active": true}"#).unwrap(),
+            json!({"active": true})
         );
     }
 }
