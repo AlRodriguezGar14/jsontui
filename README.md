@@ -42,17 +42,27 @@ Navigate mode:
 - `Tab` / `Shift+Tab`: cycle views
 - `/`: search rows
 - `n` / `N`: next / previous search match
+- `o`: add a new object key/value under the cursor (`Tab` switches key/value)
+- `dd`: delete the selected object key/value pair (`Esc` cancels after the first `d`)
+- `u`: undo the last object key/value add or delete
 - `e` or `Enter`: edit the selected value as JSON
 - `K`: rename the selected object key
 - `yy`: copy the current view
 - `Y` or `yv`: copy the selected value
 - `yk`: copy the selected `"key": value` pair
 
+In the add key/value popup, keys are typed without JSON quotes. Values infer
+JSON types: `Ada` becomes a string, `37` becomes a number, `{"a":1}` becomes an
+object, and `"37"` stays a string.
+
 ## Features
 
 - Beautify, compact, and raw JSON views
 - Synchronized outline for navigating nested objects and arrays
 - Case-insensitive search across names, paths, types, and previews
+- Object key/value insertion with separate key/value fields and inferred value types
+- Object key/value deletion from the navigator with `dd`
+- One-step undo for object key/value insertion and deletion
 - In-place value editing with JSON validation
 - Object key renaming without changing key order
 - Clipboard support through native tools with OSC 52 fallback
