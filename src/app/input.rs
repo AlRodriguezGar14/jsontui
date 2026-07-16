@@ -22,6 +22,10 @@ impl App {
             self.handle_yank_key(key);
             return;
         }
+        if self.mode == Mode::Navigate && self.pending_delete {
+            self.handle_delete_key(key);
+            return;
+        }
 
         match self.mode {
             Mode::Source => self.handle_source_key(key),
@@ -237,6 +241,8 @@ impl App {
             KeyCode::Char('Y') => self.yank_selected_value(),
             KeyCode::Char('e') | KeyCode::Enter => self.begin_value_edit(),
             KeyCode::Char('o') => self.begin_entry_add(),
+            KeyCode::Char('d') => self.begin_pair_delete(),
+            KeyCode::Char('u') => self.undo_last_add_delete(),
             KeyCode::Char('K') => self.begin_key_edit(),
             _ => {}
         }
@@ -298,6 +304,7 @@ impl App {
     /// First `y` press. Arms `pending_yank` so the next key picks what to copy.
     fn begin_yank(&mut self) {
         self.pending_yank = true;
+        self.pending_delete = false;
         self.status =
             "Yank: y copies current view, v copies selected value, k copies key/value pair."
                 .to_string();
@@ -313,6 +320,21 @@ impl App {
             KeyCode::Char('k') => self.yank_selected_key_value(),
             KeyCode::Esc => self.status = "Yank cancelled.".to_string(),
             _ => self.status = "Yank cancelled.".to_string(),
+        }
+    }
+
+    /// Second key after `d`. `d` confirms deletion, Esc cancels, anything else cancels
+    /// and is handled as a normal Navigate key.
+    fn handle_delete_key(&mut self, key: KeyEvent) {
+        self.pending_delete = false;
+
+        match key.code {
+            KeyCode::Char('d') if key.modifiers.is_empty() => self.delete_selected_pair(),
+            KeyCode::Esc => self.status = "Delete cancelled.".to_string(),
+            _ => {
+                self.status = "Delete cancelled.".to_string();
+                self.handle_navigate_key(key);
+            }
         }
     }
 
@@ -1163,6 +1185,148 @@ mod tests {
         );
     }
 
+    #[test]
+    fn d_deletes_selected_object_key_value_pair() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2, "c": 3}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.b");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert!(app.pending_delete);
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"b":2,"c":3}"#
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"c":3}"#
+        );
+        assert_eq!(app.selected_row().unwrap().path_label(), "$.c");
+        assert!(serde_json::from_str::<serde_json::Value>(&app.source).is_ok());
+        assert_eq!(app.source, app.raw_source);
+    }
+
+    #[test]
+    fn d_deletes_selected_object_subtree_pair() {
+        let mut app = App::new();
+        app.set_json(json!({"obj": {"a": 1}, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.obj");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"b":2}"#
+        );
+        assert_eq!(app.selected_row().unwrap().path_label(), "$.b");
+    }
+
+    #[test]
+    fn d_rejects_array_items_and_root_without_changing_json() {
+        let mut app = App::new();
+        app.set_json(json!({"items": [1, 2]}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.items[0]");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert!(!app.pending_delete);
+        assert!(app.error.is_some());
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"items":[1,2]}"#
+        );
+
+        select_path(&mut app, "$");
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert!(!app.pending_delete);
+        assert!(app.error.is_some());
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"items":[1,2]}"#
+        );
+    }
+
+    #[test]
+    fn esc_cancels_pending_pair_delete() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!app.pending_delete);
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"b":2}"#
+        );
+        assert_eq!(app.status, "Delete cancelled.");
+    }
+
+    #[test]
+    fn u_undoes_last_key_value_add() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.a");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        type_text(&mut app, "name");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        type_text(&mut app, "Ada");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"name":"Ada","b":2}"#
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"b":2}"#
+        );
+        assert_eq!(app.selected_row().unwrap().path_label(), "$.a");
+        assert!(app.undo_snapshot.is_none());
+    }
+
+    #[test]
+    fn u_undoes_last_key_value_delete() {
+        let mut app = App::new();
+        app.set_json(json!({"a": 1, "b": 2, "c": 3}), None);
+        app.mode = Mode::Navigate;
+        select_path(&mut app, "$.b");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"c":3}"#
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+
+        assert_eq!(
+            serde_json::to_string(app.json.as_ref().unwrap()).unwrap(),
+            r#"{"a":1,"b":2,"c":3}"#
+        );
+        assert_eq!(app.selected_row().unwrap().path_label(), "$.b");
+        assert!(app.undo_snapshot.is_none());
+    }
+
+    #[test]
     fn capital_v_enters_line_select_mode_on_selected_pretty_line() {
         let mut app = App::new();
         app.set_json(json!({"a": 1, "b": 2}), None);

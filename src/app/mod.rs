@@ -72,6 +72,13 @@ enum AddEntryField {
     Value,
 }
 
+#[derive(Debug, Clone)]
+struct UndoSnapshot {
+    json: Value,
+    selected_path: Option<Vec<PathSegment>>,
+    description: &'static str,
+}
+
 /// Display format for the parsed JSON in the main pane.
 ///
 /// `Raw` shows the original input text untouched; others re-render from the parsed value.
@@ -140,6 +147,10 @@ pub(crate) struct App {
     search_match_index: Option<usize>,
     /// `y` pressed once; next key picks what to copy (`y`, `v`, `k`, ...).
     pending_yank: bool,
+    /// `d` pressed once in Navigate; next `d` deletes, Esc cancels.
+    pending_delete: bool,
+    /// One-step undo for the last add/delete operation.
+    undo_snapshot: Option<UndoSnapshot>,
     /// Text staged for the event loop to push to the OS clipboard next tick.
     pending_clipboard: Option<String>,
     status: String,
@@ -180,6 +191,8 @@ impl App {
             search_matches: Vec::new(),
             search_match_index: None,
             pending_yank: false,
+            pending_delete: false,
+            undo_snapshot: None,
             pending_clipboard: None,
             status: "Paste JSON. Ctrl+P parses, Ctrl+B beautifies, Ctrl+M compacts.".to_string(),
             error: None,
@@ -234,6 +247,8 @@ impl App {
         self.search_matches.clear();
         self.search_match_index = None;
         self.pending_yank = false;
+        self.pending_delete = false;
+        self.undo_snapshot = None;
         self.pending_clipboard = None;
         self.status = "New JSON buffer. Paste JSON or type source, then Ctrl+P parses.".to_string();
         self.error = None;
@@ -245,6 +260,8 @@ impl App {
         match serde_json::from_str::<Value>(&self.source) {
             Ok(value) => {
                 self.raw_source = self.source.clone();
+                self.pending_delete = false;
+                self.undo_snapshot = None;
                 self.set_json(value, None);
                 self.mode = Mode::Navigate;
                 self.status = "JSON parsed. Use j/k to move and b/m/r to switch beautified, compact, and raw views."
@@ -499,6 +516,7 @@ impl App {
         self.edit_cursor = self.edit_buffer.len();
         self.editing_path = path;
         self.clear_add_entry_state();
+        self.pending_delete = false;
         self.mode = Mode::EditValue;
         self.status = "Editing value. Enter a valid JSON value.".to_string();
     }
@@ -526,6 +544,7 @@ impl App {
         self.edit_cursor = self.edit_buffer.len();
         self.editing_path = path;
         self.clear_add_entry_state();
+        self.pending_delete = false;
         self.mode = Mode::EditKey;
         self.status = "Editing key. Enter saves and keeps the JSON valid.".to_string();
     }
@@ -633,6 +652,7 @@ impl App {
         };
 
         *target = new_value;
+        self.undo_snapshot = None;
         self.after_structural_edit(path, "Value updated.");
     }
 
@@ -696,6 +716,7 @@ impl App {
 
         let mut new_path = parent_path.to_vec();
         new_path.push(PathSegment::Key(new_key));
+        self.undo_snapshot = None;
         self.after_structural_edit(new_path, "Key renamed.");
     }
 
@@ -770,6 +791,83 @@ impl App {
         self.clear_add_entry_state();
         self.after_structural_edit(new_path, "Key/value added.");
     }
+
+    /// First `d` in Navigate: arm object key/value deletion.
+    fn begin_pair_delete(&mut self) {
+        if self.selected_delete_target().is_err() {
+            self.delete_selected_pair();
+            return;
+        }
+
+        self.pending_yank = false;
+        self.pending_delete = true;
+        self.status =
+            "Delete armed. Press d again to delete this key/value pair, Esc to cancel.".to_string();
+        self.error = None;
+    }
+
+    /// `dd`: delete the selected object key/value pair.
+    fn delete_selected_pair(&mut self) {
+        let (parent_path, key) = match self.selected_delete_target() {
+            Ok(target) => target,
+            Err(message) => {
+                self.error = Some(message);
+                return;
+            }
+        };
+
+        self.stash_undo("key/value delete");
+
+        let Some(json) = &mut self.json else {
+            return;
+        };
+        let Some(parent) = get_value_at_path_mut(json, &parent_path) else {
+            self.error = Some("Selected parent no longer exists.".to_string());
+            return;
+        };
+        let Value::Object(map) = parent else {
+            self.error = Some("Selected parent is not an object.".to_string());
+            return;
+        };
+
+        if map.shift_remove(&key).is_none() {
+            self.error = Some("Selected key no longer exists.".to_string());
+            return;
+        }
+
+        self.after_structural_delete("Key/value deleted.");
+    }
+
+    fn selected_delete_target(&self) -> Result<(Vec<PathSegment>, String), String> {
+        let Some(row) = self.selected_row() else {
+            return Err("No selected row to delete.".to_string());
+        };
+        let path = row.path.clone();
+        let Some((last_segment, parent_path)) = path.split_last() else {
+            return Err("Root value has no object key/value pair to delete.".to_string());
+        };
+        let PathSegment::Key(key) = last_segment else {
+            return Err("Only object key/value pairs can be deleted.".to_string());
+        };
+
+        let Some(parent) = self
+            .json
+            .as_ref()
+            .and_then(|json| get_value_at_path(json, parent_path))
+        else {
+            return Err("Selected parent no longer exists.".to_string());
+        };
+        let Value::Object(map) = parent else {
+            return Err("Selected parent is not an object.".to_string());
+        };
+        if !map.contains_key(key) {
+            return Err("Selected key no longer exists.".to_string());
+        }
+
+        Ok((parent_path.to_vec(), key.clone()))
+    }
+
+    /// Resync derived state after an object edit: rewrite `source`/`raw_source`,
     /// reset to `Navigate`/`Pretty`, rebuild rows, and re-focus `select_path`.
     fn after_structural_edit(&mut self, select_path: Vec<PathSegment>, message: &str) {
         if let Some(json) = &self.json {
@@ -779,7 +877,47 @@ impl App {
         }
         self.mode = Mode::Navigate;
         self.format_mode = FormatMode::Pretty;
+        self.pending_delete = false;
+        self.clear_add_entry_state();
         self.rebuild_rows(Some(select_path));
+        self.status = message.to_string();
+        self.error = None;
+    }
+
+    fn undo_last_add_delete(&mut self) {
+        let Some(snapshot) = self.undo_snapshot.take() else {
+            self.error = Some("Nothing to undo.".to_string());
+            return;
+        };
+
+        self.json = Some(snapshot.json);
+        if let Some(json) = &self.json {
+            self.source = serde_json::to_string_pretty(json).unwrap_or_default();
+            self.raw_source = self.source.clone();
+            self.source_cursor = self.source.len();
+        }
+        self.mode = Mode::Navigate;
+        self.format_mode = FormatMode::Pretty;
+        self.pending_delete = false;
+        self.clear_add_entry_state();
+        self.rebuild_rows(snapshot.selected_path);
+        self.status = format!("Undid {}.", snapshot.description);
+        self.error = None;
+    }
+
+    /// Resync after deleting a row. Keeps the current row index when possible so
+    /// focus lands on the next visible row, or the previous one if the delete was last.
+    fn after_structural_delete(&mut self, message: &str) {
+        if let Some(json) = &self.json {
+            self.source = serde_json::to_string_pretty(json).unwrap_or_default();
+            self.raw_source = self.source.clone();
+            self.source_cursor = self.source.len();
+        }
+        self.mode = Mode::Navigate;
+        self.format_mode = FormatMode::Pretty;
+        self.pending_delete = false;
+        self.clear_add_entry_state();
+        self.rebuild_rows(None);
         self.status = message.to_string();
         self.error = None;
     }
@@ -802,6 +940,19 @@ impl App {
         self.add_value_cursor = 0;
         self.add_entry_field = AddEntryField::Key;
     }
+
+    fn stash_undo(&mut self, description: &'static str) {
+        let Some(json) = self.json.clone() else {
+            return;
+        };
+        self.undo_snapshot = Some(UndoSnapshot {
+            json,
+            selected_path: self.selected_row().map(|row| row.path.clone()),
+            description,
+        });
+    }
+}
+
 fn parse_inferred_json_value(text: &str) -> Result<Value, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {

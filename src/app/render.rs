@@ -488,6 +488,8 @@ impl App {
             row("Tab / S-Tab", "cycle views"),
             row("i", "edit source text"),
             row("o", "add key/value under cursor"),
+            row("dd", "delete selected key/value pair"),
+            row("u", "undo last add/delete"),
             row("e / Enter", "edit selected value as JSON"),
             row("K", "rename selected object key"),
             row("/", "search"),
@@ -527,7 +529,7 @@ impl App {
                 )],
             },
             Mode::Navigate => vec![Span::raw(
-                "j/k nodes  h/l parent/child  / search  yy copy view  Y value  yk pair  Ctrl+N new  ? help",
+                "j/k nodes  h/l parent/child  o add pair  dd delete pair  u undo  / search  yy copy view  ? help",
             )],
             Mode::LineSelect => vec![Span::raw(
                 "VISUAL LINE  j/k extend  y copy lines  Esc cancel",
