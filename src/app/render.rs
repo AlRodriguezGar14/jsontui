@@ -502,6 +502,7 @@ impl App {
             Line::from(""),
             section("Search / Edit popups"),
             row("Enter", "commit"),
+            row("Up / Down", "older / newer search query"),
             row("Tab", "switch key / value when adding"),
             row("Esc", "cancel"),
         ];
@@ -535,7 +536,7 @@ impl App {
                 "VISUAL LINE  j/k extend  y copy lines  Esc cancel",
             )],
             Mode::Search => vec![Span::raw(
-                "Enter search  Esc cancel  n/N repeat after search",
+                "Up/Down history  Enter search  Esc cancel  n/N repeat after search",
             )],
             Mode::AddEntry => vec![Span::raw(
                 "ADD  Tab key/value  Enter save  Esc cancel  value infers string, number, bool, null, object, or array",

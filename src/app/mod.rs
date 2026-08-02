@@ -143,6 +143,9 @@ pub(crate) struct App {
     add_value_cursor: usize,
     add_entry_field: AddEntryField,
     search_query: String,
+    search_history: Vec<String>,
+    search_history_index: Option<usize>,
+    search_history_draft: String,
     search_matches: Vec<usize>,
     search_match_index: Option<usize>,
     /// `y` pressed once; next key picks what to copy (`y`, `v`, `k`, ...).
@@ -188,6 +191,9 @@ impl App {
             add_value_cursor: 0,
             add_entry_field: AddEntryField::Key,
             search_query: String::new(),
+            search_history: Vec::new(),
+            search_history_index: None,
+            search_history_draft: String::new(),
             search_matches: Vec::new(),
             search_match_index: None,
             pending_yank: false,
@@ -244,6 +250,9 @@ impl App {
         self.editing_path.clear();
         self.clear_add_entry_state();
         self.search_query.clear();
+        self.search_history.clear();
+        self.search_history_index = None;
+        self.search_history_draft.clear();
         self.search_matches.clear();
         self.search_match_index = None;
         self.pending_yank = false;

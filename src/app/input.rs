@@ -352,6 +352,8 @@ impl App {
             KeyCode::Right => self.move_edit_right(),
             KeyCode::Home => self.edit_cursor = 0,
             KeyCode::End => self.edit_cursor = self.edit_buffer.len(),
+            KeyCode::Up => self.recall_older_search(),
+            KeyCode::Down => self.recall_newer_search(),
             KeyCode::Char(ch) => self.insert_edit(&ch.to_string()),
             _ => {}
         }
@@ -397,17 +399,24 @@ impl App {
         }
     }
 
-    /// `/` in `Navigate`: open the search popup pre-filled with the previous query.
+    /// `/` in `Navigate`: open an empty search popup.
     fn begin_search(&mut self) {
-        self.edit_buffer = self.search_query.clone();
-        self.edit_cursor = self.edit_buffer.len();
+        self.edit_buffer.clear();
+        self.edit_cursor = 0;
+        self.search_history_index = None;
+        self.search_history_draft.clear();
         self.mode = Mode::Search;
         self.status = "Type a search pattern. Enter jumps to the next match.".to_string();
     }
 
     /// `Enter` in search: save the query, recompute matches, jump to the first one.
     fn commit_search(&mut self) {
-        self.search_query = self.edit_buffer.clone();
+        self.search_query.clone_from(&self.edit_buffer);
+        if !self.search_query.is_empty() && self.search_history.last() != Some(&self.search_query) {
+            self.search_history.push(self.search_query.clone());
+        }
+        self.search_history_index = None;
+        self.search_history_draft.clear();
         self.mode = Mode::Navigate;
 
         if self.search_query.is_empty() {
@@ -424,6 +433,46 @@ impl App {
         }
 
         self.select_search_match_from_current(true);
+    }
+
+    /// `Up` in search: walk backward through committed queries.
+    fn recall_older_search(&mut self) {
+        if self.search_history.is_empty() {
+            return;
+        }
+
+        let index = match self.search_history_index {
+            Some(0) => 0,
+            Some(index) => index - 1,
+            None => {
+                self.search_history_draft.clone_from(&self.edit_buffer);
+                self.search_history.len() - 1
+            }
+        };
+
+        self.search_history_index = Some(index);
+        self.edit_buffer.clone_from(&self.search_history[index]);
+        self.edit_cursor = self.edit_buffer.len();
+    }
+
+    /// `Down` in search: walk forward, then restore the draft from before history browsing.
+    fn recall_newer_search(&mut self) {
+        let Some(index) = self.search_history_index else {
+            self.edit_buffer.clear();
+            self.edit_cursor = 0;
+            return;
+        };
+
+        if index + 1 < self.search_history.len() {
+            let next_index = index + 1;
+            self.search_history_index = Some(next_index);
+            self.edit_buffer
+                .clone_from(&self.search_history[next_index]);
+        } else {
+            self.search_history_index = None;
+            self.edit_buffer.clone_from(&self.search_history_draft);
+        }
+        self.edit_cursor = self.edit_buffer.len();
     }
 
     /// `n` / `N`: move to next/previous match for the last query. Errors if no prior search.
@@ -969,12 +1018,66 @@ mod tests {
     }
 
     #[test]
+    fn new_search_starts_empty_and_arrows_navigate_query_history() {
+        let mut app = App::new();
+        app.set_json(json!({"names": ["Ada", "Grace"]}), None);
+
+        for query in ["ada", "grace", "grace"] {
+            app.begin_search();
+            app.edit_buffer = query.to_string();
+            app.edit_cursor = app.edit_buffer.len();
+            app.commit_search();
+        }
+
+        assert_eq!(app.search_history, ["ada", "grace"]);
+        app.edit_buffer = "stale edit".to_string();
+
+        app.begin_search();
+
+        assert_eq!(app.mode, Mode::Search);
+        assert!(app.edit_buffer.is_empty());
+        assert_eq!(app.edit_cursor, 0);
+        type_text(&mut app, "draft");
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.edit_buffer, "grace");
+        assert_eq!(app.edit_cursor, 5);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.edit_buffer, "ada");
+        assert_eq!(app.edit_cursor, 3);
+
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+
+        assert_eq!(app.edit_buffer, "ada");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(app.edit_buffer, "grace");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert_eq!(app.edit_buffer, "draft");
+        assert_eq!(app.edit_cursor, 5);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+
+        assert!(app.edit_buffer.is_empty());
+        assert_eq!(app.edit_cursor, 0);
+    }
+
+    #[test]
     fn ctrl_n_starts_a_fresh_json_buffer() {
         let mut app = App::new();
         app.set_json(json!({"old": true}), None);
         app.source = "{\"old\":true}".to_string();
         app.raw_source = app.source.clone();
         app.mode = Mode::Navigate;
+        app.search_history = vec!["old".to_string()];
+        app.search_history_index = Some(0);
+        app.search_history_draft = "draft".to_string();
 
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
 
@@ -984,6 +1087,9 @@ mod tests {
         assert!(app.json.is_none());
         assert!(app.rows.is_empty());
         assert!(app.search_query.is_empty());
+        assert!(app.search_history.is_empty());
+        assert_eq!(app.search_history_index, None);
+        assert!(app.search_history_draft.is_empty());
         assert_eq!(app.source_edit_mode, SourceEditMode::Insert);
     }
 
